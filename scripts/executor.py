@@ -46,6 +46,7 @@ def initialize_database():
             content TEXT NOT NULL,
             chapter TEXT DEFAULT '',
             tags TEXT DEFAULT '',
+            importance INTEGER NOT NULL DEFAULT 3 CHECK(importance BETWEEN 1 AND 5),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             next_review_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             interval_days REAL DEFAULT 0,
@@ -66,6 +67,8 @@ def initialize_database():
 
     # Migrations for existing databases
     _migrate_add_column(conn, 'sources', 'tags', "TEXT DEFAULT ''")
+    _migrate_add_column(conn, 'knowledge_points', 'importance',
+                        "INTEGER NOT NULL DEFAULT 3 CHECK(importance BETWEEN 1 AND 5)")
 
     conn.commit()
     conn.close()
@@ -77,6 +80,14 @@ def _migrate_add_column(conn, table, column, col_def):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
     except sqlite3.OperationalError:
         pass
+
+
+def _normalize_importance(value):
+    try:
+        importance = int(value)
+    except (TypeError, ValueError):
+        importance = 3
+    return max(1, min(5, importance))
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +209,11 @@ def add_knowledge_points(source_id, points):
     for p in points:
         cursor = conn.execute(
             """INSERT INTO knowledge_points
-               (source_id, title, content, chapter, tags, next_review_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (source_id, title, content, chapter, tags, importance, next_review_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (source_id, p['title'], p['content'],
-             p.get('chapter', ''), p.get('tags', ''), now)
+             p.get('chapter', ''), p.get('tags', ''),
+             _normalize_importance(p.get('importance', 3)), now)
         )
         ids.append(cursor.lastrowid)
     conn.commit()
@@ -231,6 +243,7 @@ def search_knowledge(query, limit=10):
             "content": r['content'],
             "chapter": r['chapter'],
             "tags": r['tags'],
+            "importance": r['importance'],
             "source_id": r['source_id'],
             "source_title": r.get('source_title', ''),
             "source_local_path": r.get('source_local_path', ''),
@@ -314,6 +327,7 @@ def get_review_candidates(limit=5, topic=None):
             "content": c['content'],
             "chapter": c['chapter'],
             "tags": c['tags'],
+            "importance": c['importance'],
             "source_id": c['source_id'],
             "source_title": c.get('source_title', ''),
             "source_local_path": c.get('source_local_path', ''),
@@ -462,7 +476,28 @@ def _clean_subtitle(raw_text):
     return '\n'.join(text_lines)
 
 
-def fetch_youtube(url):
+def _slugify_filename(text):
+    cleaned = re.sub(r'[\\/:*?"<>|]+', '_', text or '')
+    cleaned = re.sub(r'\s+', '_', cleaned).strip('._ ')
+    return (cleaned or 'youtube_subtitle')[:120]
+
+
+def _run_yt_dlp(args, timeout):
+    commands = [
+        ['yt-dlp', *args],
+        [sys.executable, '-m', 'yt_dlp', *args],
+    ]
+    for cmd in commands:
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    raise FileNotFoundError('yt-dlp not available')
+
+
+def fetch_youtube(url, local_filename=None):
     """Fetch YouTube subtitles. Tries youtube_transcript_api then yt-dlp."""
     match = re.search(r'(?:v=|/v/|youtu\.be/|/embed/)([a-zA-Z0-9_-]{11})', url)
     if not match:
@@ -477,10 +512,7 @@ def fetch_youtube(url):
 
     # --- try to get title via yt-dlp ---
     try:
-        r = subprocess.run(
-            ['yt-dlp', '--print', 'title', '--no-download', url],
-            capture_output=True, text=True, timeout=30,
-        )
+        r = _run_yt_dlp(['--print', 'title', '--no-download', url], timeout=30)
         if r.returncode == 0 and r.stdout.strip():
             title = r.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -511,13 +543,13 @@ def fetch_youtube(url):
     if content is None:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                subprocess.run([
-                    'yt-dlp', '--write-sub', '--write-auto-sub',
+                _run_yt_dlp([
+                    '--write-sub', '--write-auto-sub',
                     '--sub-lang', 'zh,en,ja',
                     '--skip-download', '--no-check-certificates',
                     '-o', os.path.join(tmpdir, 'video'),
                     url,
-                ], capture_output=True, text=True, timeout=120)
+                ], timeout=120)
 
                 sub_files = sorted(
                     [f for f in os.listdir(tmpdir)
@@ -543,12 +575,24 @@ def fetch_youtube(url):
         }))
         return
 
+    os.makedirs(LOCAL_REF_DIR, exist_ok=True)
+    if local_filename:
+        base_name = os.path.basename(local_filename)
+        if not base_name.lower().endswith('.txt'):
+            base_name = f"{base_name}.txt"
+    else:
+        base_name = f"{_slugify_filename(title)}_{video_id}.txt"
+    local_path = os.path.join(LOCAL_REF_DIR, base_name)
+
+    with open(local_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
     print(json.dumps({
         "video_id": video_id,
         "title": title,
-        "content": content,
         "method": method,
         "char_count": len(content),
+        "local_path": os.path.relpath(local_path, SKILL_DIR).replace('\\', '/'),
     }, ensure_ascii=False))
 
 
@@ -601,7 +645,7 @@ def main():
         'record-review':      lambda: record_review(args['point_id'], args['level']),
         'search':             lambda: search_knowledge(args['query'], args.get('limit', 10)),
         'stats':              lambda: get_statistics(),
-        'fetch-youtube':      lambda: fetch_youtube(args['url']),
+        'fetch-youtube':      lambda: fetch_youtube(args['url'], args.get('local_filename')),
         'execute-sql':        lambda: execute_sql(args['sql']),
     }
 

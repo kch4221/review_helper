@@ -1,11 +1,25 @@
 ---
 name: review_helper
-description: Help users break down learning chapters/courses into knowledge points and review them using spaced repetition based on the Ebbinghaus forgetting curve (SM-2 algorithm). Reference materials are stored in `local_reference/`, knowledge points and review data in `data.sqlite3`, Python scripts in `scripts/`.
+description: Store learning text directly and run spaced review. Invoke when users say “我学了”, “i learned”, “help me review”, “复习”, “review”, or ask to import learning materials.
 ---
 
 # Review Helper
 
-A spaced repetition learning assistant. It breaks down study materials into knowledge points and schedules reviews using the SM-2 algorithm (based on the Ebbinghaus forgetting curve).
+A spaced repetition learning assistant. It stores full learning text first and requires knowledge-point extraction for SM-2 reviews (based on the Ebbinghaus forgetting curve).
+
+## Invocation Priority
+
+Always invoke this skill immediately when the user intent matches learning import or review, especially for these phrases:
+
+- "我学了"
+- "i learned"
+- "help me review"
+- "复习"
+- "review"
+- "今天复习什么"
+- "what to review"
+
+Do not wait for extra reminders once these signals appear.
 
 ## Directory Structure
 
@@ -38,6 +52,7 @@ A spaced repetition learning assistant. It breaks down study materials into know
 | content        | TEXT      | Core concept description (NOT a Q&A, just the key idea) |
 | chapter        | TEXT      | Chapter/section name                              |
 | tags           | TEXT      | Comma-separated tags                              |
+| importance     | INTEGER   | Importance level 1-5 (5 is most important)        |
 | created_at     | TIMESTAMP | Creation time                                     |
 | next_review_at | TIMESTAMP | Next scheduled review time                        |
 | interval_days  | REAL      | Current review interval in days                   |
@@ -64,7 +79,7 @@ All commands: `python {SKILL_DIR}/scripts/executor.py <command> ['<json_args>']`
 |----------------------|-----------|-------------|
 | `init`               | (none) | Initialize database and directories |
 | `add-source`         | `{"title":"...", "type":"book\|course\|url\|file\|youtube", "local_path":"...", "url":"...", "tags":"..."}` | Register a source with tags |
-| `add-points`         | `{"source_id":N, "points":[{"title":"...", "content":"...", "chapter":"...", "tags":"..."}]}` | Add knowledge points |
+| `add-points`         | `{"source_id":N, "points":[{"title":"...", "content":"...", "chapter":"...", "tags":"...", "importance":3}]}` | Add knowledge points |
 | `search-sources`     | `{"query":"...", "limit":10}` | Search sources by title/tags/url; returns existing_tags for reuse |
 | `list-sources`       | (none) | List all sources with all_tags summary |
 | `get-source-content` | `{"source_id":N}` | Read & return full content of a source's local file |
@@ -72,7 +87,7 @@ All commands: `python {SKILL_DIR}/scripts/executor.py <command> ['<json_args>']`
 | `record-review`      | `{"point_id":N, "level":N}` | Record a review result (level 0-5) |
 | `search`             | `{"query":"...", "limit":10}` | Search knowledge points by keyword |
 | `stats`              | (none) | Show review statistics |
-| `fetch-youtube`      | `{"url":"..."}` | Fetch YouTube subtitles (returns title + content) |
+| `fetch-youtube`      | `{"url":"...", "local_filename":"...(optional)"}` | Fetch subtitles and save directly to local_reference (returns title + local_path, no content output) |
 | `execute-sql`        | `{"sql":"..."}` | Run raw SQL (escape hatch) |
 
 ## Setup (First Time)
@@ -105,35 +120,52 @@ This creates the tables and the `local_reference/` directory. It is safe to run 
    - **Local file**: Use `Read` to read it.
    - **User pastes text**: Use it directly.
 
-3. **Save reference material** — save the **complete, original** content:
-   - Write to `{SKILL_DIR}/local_reference/<slug>.md` (or `.txt`)
-   - Use a meaningful slug (lowercase, underscores, e.g. `python_decorators.md`)
+3. **Save reference material immediately** — save the **complete, original** content as plain text:
+   - Write to `{SKILL_DIR}/local_reference/<slug>.txt`
+   - Use a meaningful slug (lowercase, underscores, e.g. `python_decorators.txt`)
    - Keep the content as intact as possible; do NOT summarize or truncate. This file is the authoritative reference used later for detailed explanations.
+   - After text is obtained from file / WebFetch / user input, store it directly first. Do not do summarization or knowledge-point extraction in this step.
+   - For YouTube, `fetch-youtube` already performs direct file storage, so do not re-print or re-save subtitle content.
 
 4. **Register the source** (use tags from step 1):
    ```
-   python {SKILL_DIR}/scripts/executor.py add-source '{"title":"<title>", "type":"<type>", "local_path":"local_reference/<slug>.md", "url":"<url_or_empty>", "tags":"<comma,separated,tags>"}'
+   python {SKILL_DIR}/scripts/executor.py add-source '{"title":"<title>", "type":"<type>", "local_path":"local_reference/<slug>.txt", "url":"<url_or_empty>", "tags":"<comma,separated,tags>"}'
    ```
+   For YouTube sources, set `local_path` to the returned `fetch-youtube.local_path`.
    Returns `{"source_id": N}`.
 
-5. **Extract knowledge points** from the content. For each point, create:
+5. **Load source text** from `local_reference/` using `get-source-content`.
+
+6. **Extract knowledge points (required)** from the content. For each point, create:
    - `title`: Short descriptive title (e.g. "Python装饰器的本质")
-   - `content`: The core concept or key idea described clearly and concisely. This is **NOT a question and NOT an answer** — it is a factual statement of what the user should understand. During review, the AI will generate questions dynamically from this.
+   - `content`: A moderately detailed concept statement, not overly brief. Include the core definition/principle, key mechanism or conditions, and at least one concrete implication/example when possible. This is **NOT a question and NOT an answer** — it is a factual statement of what the user should understand. During review, the AI will generate questions dynamically from this.
    - `chapter`: Chapter or section name
    - `tags`: Comma-separated relevant tags (reuse from source tags when possible)
+   - `importance`: 1-5 integer (5 highest). Use 5 for foundational/high-frequency/error-prone concepts, 4 for key supporting concepts, 3 for normal core concepts, 2 for secondary details, 1 for low-priority background.
 
    **Extraction guidelines**:
    - Each point should capture ONE atomic concept
-   - Describe the concept clearly enough that the AI can later formulate good questions from it
+   - `content` should usually be 2-4 sentences, detailed enough for high-quality questioning and explanation
+   - Describe not only "what it is", but also key conditions, mechanism, and practical meaning
    - Aim for 5-15 points per chapter depending on density
    - Include both conceptual knowledge and practical/applied knowledge
 
-6. **Save knowledge points**:
+7. **Show draft knowledge points to user for confirmation**:
+   - Present titles + concise previews of `content`
+   - Ask user whether to revise, merge/split, add, or delete points
+   - If user gives feedback, apply revisions before saving
+
+8. **Finalize points**:
+   - If user requests changes, revise and re-show updated draft for confirmation
+   - If user approves directly, proceed to save immediately
+
+9. **Save knowledge points**:
    ```
    python {SKILL_DIR}/scripts/executor.py add-points '{"source_id":<id>, "points":[...]}'
    ```
+   If `importance` is missing, default to 3.
 
-7. **Confirm**: Show the user the count and list of knowledge point titles.
+10. **Confirm import result**: Show source title, source_id, local_path, tags, plus knowledge point count and titles.
 
 #### Workflow 1a: YouTube Import
 
@@ -142,6 +174,10 @@ When the user provides a YouTube link:
 1. **Fetch subtitles**:
    ```
    python {SKILL_DIR}/scripts/executor.py fetch-youtube '{"url":"<youtube_url>"}'
+   ```
+   Optionally set filename:
+   ```
+   python {SKILL_DIR}/scripts/executor.py fetch-youtube '{"url":"<youtube_url>", "local_filename":"<slug>.txt"}'
    ```
    This tries `youtube_transcript_api` then `yt-dlp`. If both fail, ask the user to install one:
    ```
@@ -152,11 +188,11 @@ When the user provides a YouTube link:
    pip install yt-dlp
    ```
 
-2. The response includes `title` and `content` (subtitle text). Save the **full subtitle text** to `local_reference/` and continue with Workflow 1 step 4 onwards, using `type: "youtube"`.
+2. The response includes `title` and `local_path` and does not print subtitle content. Use `local_path` directly in `add-source` and continue with Workflow 1 step 4 onwards, using `type: "youtube"`.
 
 ### Workflow 2: Review Knowledge
 
-**Trigger**: User asks to review. Keywords: "复习", "review", "今天复习什么", "what to review".
+**Trigger**: User asks to review. Keywords: "我学了", "i learned", "help me review", "复习", "review", "今天复习什么", "what to review".
 
 **Steps**:
 
